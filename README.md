@@ -1,0 +1,2 @@
+# unmineable-unpaid-earnings-usd
+ 
