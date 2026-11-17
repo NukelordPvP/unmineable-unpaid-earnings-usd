@@ -2,8 +2,8 @@
 // ==UserScript==
 // @name         unMineable - Unpaid Earnings USD
 // @namespace    https://unmineable.com/
-// @version      2.1
-// @description  Displays USD value of unpaid mining earnings with automatic coin detection
+// @version      2.2
+// @description  Shows USD values for all unpaid mining balances, including split payments
 // @match        https://unmineable.com/account/*
 // @grant        GM_xmlhttpRequest
 // @connect      api.coingecko.com
@@ -14,7 +14,21 @@
 (function () {
     'use strict';
 
-    const USD_ELEMENT_ID = 'unmineable-usd-value';
+    // ============================================================
+    // CONFIGURATION
+    // ============================================================
+
+    const USD_ELEMENT_CLASS = 'unmineable-usd-value';
+
+    const BALANCE_UPDATE_INTERVAL = 2000;
+    const PRICE_REFRESH_INTERVAL = 60000;
+
+    const priceCache = {};
+    const pendingRequests = {};
+
+    // ============================================================
+    // COINGECKO COIN IDS
+    // ============================================================
 
     const COIN_IDS = {
         BTC: 'bitcoin',
@@ -51,34 +65,12 @@
         POL: 'polygon-ecosystem-token'
     };
 
-    const priceCache = {};
-
-    let currentCoin = null;
-    let currentPrice = null;
-    let priceRequestCoin = null;
-
     // ============================================================
-    // FIND BALANCE
+    // GET COIN FROM INDIVIDUAL ASSET CARD
     // ============================================================
 
-    function findBalanceElement() {
-        return (
-            document.querySelector(
-                '.min-height-balance.skeleton-container .bal-contents .count-up-balance'
-            ) ||
-            document.querySelector(
-                '.bal-contents .count-up-balance'
-            ) ||
-            document.querySelector('.count-up-balance')
-        );
-    }
-
-    // ============================================================
-    // DETECT COIN
-    // ============================================================
-
-    function detectCoin() {
-        const logo = document.querySelector('.coin-logo');
+    function detectCoin(card) {
+        const logo = card.querySelector('.coin-logo');
 
         if (!logo) return null;
 
@@ -87,59 +79,38 @@
 
         let match = alt.match(/^([A-Z0-9]+)\s+logo$/i);
 
-        if (match) return match[1].toUpperCase();
+        if (match) {
+            return match[1].toUpperCase();
+        }
 
         match = src.match(/\/([A-Z0-9]+)\.png/i);
 
-        if (match) return match[1].toUpperCase();
+        if (match) {
+            return match[1].toUpperCase();
+        }
 
         return null;
     }
 
     // ============================================================
-    // PRICE CACHE
-    // ============================================================
-
-    function setPrice(coin, price, source) {
-        priceCache[coin] = {
-            price: price,
- timestamp: Date.now()
-        };
-
-        if (currentCoin !== coin) return;
-
-        currentPrice = price;
-        priceRequestCoin = null;
-
-        console.log(
-            '[unMineable USD]',
-            coin + '/USD:',
-            price,
-            '(' + source + ')'
-        );
-
-        updateUSD();
-    }
-
-    // ============================================================
-    // FETCH PRICE
+    // FETCH COIN PRICE
     // ============================================================
 
     function fetchCoinPrice(coin) {
-        if (!coin || priceRequestCoin === coin) return;
+        if (!coin) return;
 
         const cached = priceCache[coin];
 
         if (
             cached &&
-            Date.now() - cached.timestamp < 60000
+            Date.now() - cached.timestamp < PRICE_REFRESH_INTERVAL
         ) {
-            currentPrice = cached.price;
-            updateUSD();
             return;
         }
 
-        priceRequestCoin = coin;
+        if (pendingRequests[coin]) return;
+
+        pendingRequests[coin] = true;
 
         const coinId = COIN_IDS[coin];
 
@@ -150,10 +121,12 @@
 
         GM_xmlhttpRequest({
             method: 'GET',
+
             url:
             'https://api.coingecko.com/api/v3/simple/price' +
             '?ids=' + encodeURIComponent(coinId) +
             '&vs_currencies=usd',
+
             timeout: 10000,
 
             onload: function (response) {
@@ -161,7 +134,10 @@
                     const data = JSON.parse(response.responseText);
                     const price = Number(data?.[coinId]?.usd);
 
-                    if (Number.isFinite(price) && price > 0) {
+                    if (
+                        Number.isFinite(price) &&
+                        price > 0
+                    ) {
                         setPrice(coin, price, 'CoinGecko');
                     } else {
                         fetchBinance(coin);
@@ -188,9 +164,11 @@
     function fetchBinance(coin) {
         GM_xmlhttpRequest({
             method: 'GET',
+
             url:
             'https://api.binance.com/api/v3/ticker/price' +
             '?symbol=' + encodeURIComponent(coin + 'USDT'),
+
                           timeout: 10000,
 
                           onload: function (response) {
@@ -198,78 +176,113 @@
                                   const data = JSON.parse(response.responseText);
                                   const price = Number(data?.price);
 
-                                  if (Number.isFinite(price) && price > 0) {
+                                  if (
+                                      Number.isFinite(price) &&
+                                      price > 0
+                                  ) {
                                       setPrice(coin, price, 'Binance');
                                   } else {
-                                      priceRequestCoin = null;
-                                      console.error(
-                                          '[unMineable USD] Binance price unavailable:',
+                                      finishRequest(coin);
+                                      console.warn(
+                                          '[unMineable USD] Price unavailable:',
                                           coin
                                       );
                                   }
                               } catch (error) {
-                                  priceRequestCoin = null;
+                                  finishRequest(coin);
                                   console.error(error);
                               }
                           },
 
                           onerror: function () {
-                              priceRequestCoin = null;
-                              console.error(
+                              finishRequest(coin);
+                              console.warn(
                                   '[unMineable USD] Binance unavailable:',
                                   coin
                               );
                           },
 
                           ontimeout: function () {
-                              priceRequestCoin = null;
+                              finishRequest(coin);
                           }
         });
     }
 
     // ============================================================
-    // USD DISPLAY
+    // SAVE PRICE
     // ============================================================
 
-    function getOrCreateUSDElement(balanceElement) {
-        const container =
-        balanceElement.closest('.bal-contents') ||
-        balanceElement.parentElement;
+    function setPrice(coin, price, source) {
+        priceCache[coin] = {
+            price: price,
+            timestamp: Date.now()
+        };
 
-        if (!container) return null;
+        finishRequest(coin);
 
-        let element = document.getElementById(USD_ELEMENT_ID);
+        console.log(
+            '[unMineable USD]',
+            coin + '/USD:',
+            price,
+            '(' + source + ')'
+        );
 
-        if (!element || !container.contains(element)) {
-            element = document.createElement('span');
+        updateAllCards();
+    }
 
-            element.id = USD_ELEMENT_ID;
-
-            element.style.cssText = [
-                'display:inline-block',
-                'font-size:18px',
-                'font-weight:500',
-                'margin-left:12px',
-                'color:#4ade80',
-                'white-space:nowrap',
-                'vertical-align:middle',
-                'pointer-events:none'
-            ].join(';');
-
-            container.appendChild(element);
-        }
-
-        return element;
+    function finishRequest(coin) {
+        delete pendingRequests[coin];
     }
 
     // ============================================================
-    // UPDATE DISPLAY
+    // GET OR CREATE USD DISPLAY
     // ============================================================
 
-    function updateUSD() {
-        const balanceElement = findBalanceElement();
+    function getOrCreateUSDElement(balanceElement) {
+        const container = balanceElement.parentElement;
+
+        if (!container) return null;
+
+        let usdElement = container.querySelector(
+            '.' + USD_ELEMENT_CLASS
+        );
+
+        if (!usdElement) {
+            usdElement = document.createElement('span');
+
+            usdElement.className = USD_ELEMENT_CLASS;
+
+            usdElement.style.cssText = `
+            display: inline-block;
+            font-size: 18px;
+            font-weight: 500;
+            margin-left: 12px;
+            color: #4ade80;
+            white-space: nowrap;
+            vertical-align: middle;
+            pointer-events: none;
+            `;
+
+            container.appendChild(usdElement);
+        }
+
+        return usdElement;
+    }
+
+    // ============================================================
+    // UPDATE INDIVIDUAL ASSET CARD
+    // ============================================================
+
+    function updateCard(card) {
+        const balanceElement = card.querySelector(
+            '.count-up-balance'
+        );
 
         if (!balanceElement) return;
+
+        const coin = detectCoin(card);
+
+        if (!coin) return;
 
         const balanceText = balanceElement.textContent.trim();
 
@@ -279,17 +292,23 @@
 
         if (!Number.isFinite(balance)) return;
 
-        const usdElement = getOrCreateUSDElement(balanceElement);
+        const usdElement = getOrCreateUSDElement(
+            balanceElement
+        );
 
         if (!usdElement) return;
 
-        if (!currentCoin || !Number.isFinite(currentPrice)) {
+        const cached = priceCache[coin];
+
+        if (!cached) {
             usdElement.textContent = '≈ $...';
-            usdElement.title = 'Waiting for coin price';
+            usdElement.title = 'Waiting for ' + coin + '/USD price';
+
+            fetchCoinPrice(coin);
             return;
         }
 
-        const usdValue = balance * currentPrice;
+        const usdValue = balance * cached.price;
 
         usdElement.textContent =
         '≈ $' + usdValue.toLocaleString('en-US', {
@@ -298,31 +317,47 @@
         });
 
         usdElement.title =
-        balance + ' ' + currentCoin +
-        ' × $' + currentPrice.toLocaleString('en-US') +
-        ' ' + currentCoin + '/USD';
+        balance + ' ' + coin +
+        ' × $' + cached.price.toLocaleString('en-US') +
+        ' ' + coin + '/USD';
     }
 
     // ============================================================
-    // SCAN PAGE
+    // UPDATE ALL ASSET CARDS
     // ============================================================
 
-    function scanPage() {
-        const coin = detectCoin();
+    function updateAllCards() {
+        const cards = document.querySelectorAll(
+            '.asset-card'
+        );
 
-        if (coin && coin !== currentCoin) {
-            console.log('[unMineable USD] Selected coin:', coin);
+        cards.forEach(function (card) {
+            updateCard(card);
+        });
+    }
 
-            currentCoin = coin;
-            currentPrice = null;
+    // ============================================================
+    // REFRESH ALL PRICES
+    // ============================================================
 
-            updateUSD();
+    function refreshPrices() {
+        const cards = document.querySelectorAll(
+            '.asset-card'
+        );
+
+        const coins = new Set();
+
+        cards.forEach(function (card) {
+            const coin = detectCoin(card);
+
+            if (coin) {
+                coins.add(coin);
+            }
+        });
+
+        coins.forEach(function (coin) {
             fetchCoinPrice(coin);
-
-            return;
-        }
-
-        updateUSD();
+        });
     }
 
     // ============================================================
@@ -330,17 +365,22 @@
     // ============================================================
 
     function start() {
-        console.log('[unMineable USD] v2.1 started');
+        console.log(
+            '[unMineable USD] Script v2.2 started'
+        );
 
-        scanPage();
+        updateAllCards();
+        refreshPrices();
 
-        setInterval(scanPage, 2000);
+        setInterval(
+            updateAllCards,
+            BALANCE_UPDATE_INTERVAL
+        );
 
-        setInterval(function () {
-            if (currentCoin) {
-                fetchCoinPrice(currentCoin);
-            }
-        }, 60000);
+        setInterval(
+            refreshPrices,
+            PRICE_REFRESH_INTERVAL
+        );
     }
 
     setTimeout(start, 2000);
