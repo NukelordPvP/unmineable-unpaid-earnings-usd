@@ -2,7 +2,7 @@
 // ==UserScript==
 // @name         unMineable - Unpaid Earnings USD
 // @namespace    https://unmineable.com/
-// @version      2.2
+// @version      2.4
 // @description  Shows USD values for all unpaid mining balances, including split payments
 // @match        https://unmineable.com/account/*
 // @grant        GM_xmlhttpRequest
@@ -62,7 +62,8 @@
         CRV: 'curve-dao-token',
         FTM: 'fantom',
         MATIC: 'matic-network',
-        POL: 'polygon-ecosystem-token'
+        POL: 'polygon-ecosystem-token',
+        PRL: 'pearl-research' // Pearl Research (PRL)
     };
 
     // ============================================================
@@ -366,7 +367,7 @@
 
     function start() {
         console.log(
-            '[unMineable USD] Script v2.2 started'
+            '[unMineable USD] Script v2.3 started'
         );
 
         updateAllCards();
